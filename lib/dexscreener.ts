@@ -2,17 +2,6 @@ import { ChainId, TokenPair } from "./types";
 
 const BASE = "https://api.dexscreener.com";
 
-// DexScreener has no single "new pairs for chain X" REST endpoint that's free.
-// Practical workaround: search against the chain's most common quote tokens,
-// which returns freshly created pairs alongside established ones, then we
-// filter/sort client-side by pairCreatedAt. This is the same approach most
-// free scanner bots use. For a firehose of every new pair the moment it's
-// created you'd want DexScreener's paid data feed or your own chain indexer.
-const DISCOVERY_QUERIES: Record<ChainId, string[]> = {
-  bsc: ["WBNB", "BUSD", "USDT"],
-  solana: ["SOL", "USDC"],
-};
-
 const DEX_CHAIN_ID: Record<ChainId, string> = {
   bsc: "bsc",
   solana: "solana",
@@ -65,30 +54,84 @@ function toTokenPair(p: RawPair, chain: ChainId): TokenPair | null {
   };
 }
 
-export async function discoverNewPairs(chain: ChainId): Promise<TokenPair[]> {
-  const queries = DISCOVERY_QUERIES[chain];
+interface TokenProfileEntry {
+  chainId: string;
+  tokenAddress: string;
+}
+
+// The real discovery sources: newly-submitted token profiles and newly
+// boosted tokens. Both list *tokens*, not pairs, so we batch-resolve each
+// candidate's market data via /tokens/v1/{chain}/{address}.
+// Caveat: this only surfaces tokens that submitted a DexScreener profile or
+// paid for a boost — anonymous pump.fun-style launches that never do either
+// won't show up here. There's no free "every pair the instant it's created"
+// firehose; that requires a paid feed or your own chain indexer.
+async function fetchCandidateAddresses(chain: ChainId): Promise<string[]> {
   const dexChain = DEX_CHAIN_ID[chain];
+  const endpoints = [
+    `${BASE}/token-profiles/latest/v1`,
+    `${BASE}/token-boosts/latest/v1`,
+    `${BASE}/token-boosts/top/v1`,
+  ];
+
   const results = await Promise.allSettled(
-    queries.map((q) =>
-      fetch(`${BASE}/latest/dex/search?q=${encodeURIComponent(q)}`, {
+    endpoints.map((url) =>
+      fetch(url, {
         headers: { Accept: "application/json" },
         next: { revalidate: 0 },
       }).then((r) => {
-        if (!r.ok) throw new Error(`DexScreener search failed: ${r.status}`);
+        if (!r.ok) throw new Error(`DexScreener ${url} failed: ${r.status}`);
+        return r.json();
+      })
+    )
+  );
+
+  const addresses = new Set<string>();
+  for (const res of results) {
+    if (res.status !== "fulfilled") continue;
+    const entries: TokenProfileEntry[] = Array.isArray(res.value)
+      ? res.value
+      : res.value?.data ?? [];
+    for (const e of entries) {
+      if (e.chainId === dexChain && e.tokenAddress) {
+        addresses.add(e.tokenAddress);
+      }
+    }
+  }
+  return Array.from(addresses);
+}
+
+export async function discoverNewPairs(chain: ChainId): Promise<TokenPair[]> {
+  const addresses = await fetchCandidateAddresses(chain);
+  if (addresses.length === 0) return [];
+
+  // /tokens/v1 accepts up to 30 comma-separated addresses per call
+  const batches: string[][] = [];
+  for (let i = 0; i < addresses.length; i += 30) {
+    batches.push(addresses.slice(i, i + 30));
+  }
+
+  const dexChain = DEX_CHAIN_ID[chain];
+  const batchResults = await Promise.allSettled(
+    batches.map((batch) =>
+      fetch(`${BASE}/tokens/v1/${dexChain}/${batch.join(",")}`, {
+        headers: { Accept: "application/json" },
+        next: { revalidate: 0 },
+      }).then((r) => {
+        if (!r.ok) throw new Error(`DexScreener tokens/v1 failed: ${r.status}`);
         return r.json();
       })
     )
   );
 
   const seen = new Map<string, TokenPair>();
-  for (const res of results) {
+  for (const res of batchResults) {
     if (res.status !== "fulfilled") continue;
-    const pairs: RawPair[] = res.value?.pairs ?? [];
+    const pairs: RawPair[] = Array.isArray(res.value) ? res.value : [];
     for (const p of pairs) {
       if (p.chainId !== dexChain) continue;
       const tp = toTokenPair(p, chain);
       if (!tp) continue;
-      // keep the pair with higher liquidity if the token shows up twice
       const existing = seen.get(tp.tokenAddress);
       if (!existing || tp.liquidityUsd > existing.liquidityUsd) {
         seen.set(tp.tokenAddress, tp);
